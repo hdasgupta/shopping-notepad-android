@@ -18,6 +18,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      HAS_SIGNING_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+
     steps:
       - name: Checkout repository and tags
         uses: actions/checkout@v4
@@ -30,21 +34,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Locate Android SDK
+      - name: Locate Android SDK tools
         shell: bash
         run: |
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)"
 
-          SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)"
           if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager was not found in $SDK/cmdline-tools"
+            echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools"
             exit 1
           fi
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "Using $SDKMANAGER"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install Android SDK packages
         shell: bash
@@ -56,52 +57,45 @@ jobs:
             "build-tools;35.0.0"
 
       - name: Build release APK
-        shell: bash
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon clean assembleRelease
 
-      - name: Prepare APK
-        id: apk
+      - name: Locate release APK
         shell: bash
         run: |
           APK="$(find app/build/outputs/apk/release \
             -maxdepth 1 -type f -name '*.apk' 2>/dev/null | head -n 1)"
 
           if [ -z "$APK" ]; then
-            echo "Release APK not found. Available APK files:"
+            echo "Release APK not found."
             find . -type f -path '*/build/outputs/apk/*/*.apk' || true
             exit 1
           fi
 
           mkdir -p release
           cp "$APK" release/ShoppingNotepad-unsigned.apk
-          echo "path=release/ShoppingNotepad-unsigned.apk" >> "$GITHUB_OUTPUT"
           echo "Found APK: $APK"
 
-      # Optional signing. Configure all four repository secrets to enable it.
-      - name: Decode Android signing keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
-        shell: bash
+      - name: Decode signing keystore
+        if: env.HAS_SIGNING_KEYSTORE == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
 
       - name: Sign APK
-        id: signing
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
-        shell: bash
+        if: env.HAS_SIGNING_KEYSTORE == 'true'
         env:
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
         run: |
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          APKSIGNER="$(find "$SDK/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
 
           if [ -z "$APKSIGNER" ]; then
-            echo "apksigner was not found."
+            echo "apksigner not found."
             exit 1
           fi
 
@@ -114,9 +108,8 @@ jobs:
             release/ShoppingNotepad-unsigned.apk
 
           "$APKSIGNER" verify --verbose release/ShoppingNotepad.apk
-          echo "path=release/ShoppingNotepad.apk" >> "$GITHUB_OUTPUT"
 
-      - name: Select release asset
+      - name: Select APK for release
         id: asset
         shell: bash
         run: |
@@ -124,6 +117,7 @@ jobs:
             echo "path=release/ShoppingNotepad.apk" >> "$GITHUB_OUTPUT"
           else
             echo "path=release/ShoppingNotepad-unsigned.apk" >> "$GITHUB_OUTPUT"
+            echo "::warning::Signing secrets are missing. Publishing an unsigned APK."
           fi
 
       - name: Calculate next patch version
@@ -131,15 +125,15 @@ jobs:
         shell: bash
         run: |
           git fetch --tags --force
-
           TAG="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
 
           if [ -z "$TAG" ]; then
             VERSION="1.0.0"
           else
             VERSION="${TAG#v}"
+
             if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "Latest tag '$TAG' is not a valid vMAJOR.MINOR.PATCH version."
+              echo "Invalid version tag: $TAG"
               exit 1
             fi
 
@@ -149,7 +143,6 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Creating release v$VERSION"
 
       - name: Publish APK to GitHub Release
         uses: softprops/action-gh-release@v2
