@@ -1,0 +1,104 @@
+name: Build and publish APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shopping-notepad-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build signed APK and publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source and release tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next app version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST_TAG="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1 || true)"
+          if [[ -z "$LATEST_TAG" ]]; then
+            VERSION="1.0.0"
+          else
+            VERSION_CORE="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_CORE"
+            if [[ ! "$MAJOR" =~ ^[0-9]+$ || ! "$MINOR" =~ ^[0-9]+$ || ! "$PATCH" =~ ^[0-9]+$ ]]; then
+              echo "Latest tag '$LATEST_TAG' is not a vMAJOR.MINOR.PATCH version." >&2
+              exit 1
+            fi
+            PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          VERSION_CODE=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Next release: v$VERSION (versionCode=$VERSION_CODE)"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform and build tools
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Decode release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_BASE64:-}" ]]; then
+            echo "Missing GitHub Secret ANDROID_KEYSTORE_BASE64. See README.md -> GitHub Release setup." >&2
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/shopping-notepad-release.jks"
+          test -s "$RUNNER_TEMP/shopping-notepad-release.jks"
+
+      - name: Build signed release APK
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/shopping-notepad-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew --no-daemon clean assembleRelease \
+            -PappVersionName="$APP_VERSION" \
+            -PappVersionCode="$APP_VERSION_CODE"
+          mkdir -p release-output
+          cp app/build/outputs/apk/release/app-release.apk "release-output/Shopping-Notepad-${APP_VERSION}.apk"
+
+      - name: Publish APK-only GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}
+          name: Shopping Notepad v${{ env.APP_VERSION }}
+          body: |
+            Install the Android app using `Shopping-Notepad-${{ env.APP_VERSION }}.apk` below.
+
+            The workflow uploads the APK only. GitHub may also show automatically generated source-code archive links for this tag; those are not installable APKs.
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: release-output/Shopping-Notepad-${{ env.APP_VERSION }}.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

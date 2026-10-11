@@ -1,0 +1,12 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+.DS_Store
+.externalNativeBuild/
+.cxx/
+release-key.jks
+*.jks
+*.keystore
+release-output/
